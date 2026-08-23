@@ -23,6 +23,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
+CALENDAR_VERSION = "2026-08-23-mh-hangmattan-v3"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -35,6 +36,7 @@ SOURCES = {
     "Playhouse": "https://playhouse.nu/program/",
     "Skeppet GBG": "https://www.skeppetgbg.se/?post_type=tribe_events",
     "Unity Jazz": "https://www.unityjazz.se/program",
+    "Musikens Hus & Hängmattan": "https://www.musikenshus.se/kalender/",
     "Utopia Jazz": "https://billetto.se/users/utopia-jazz",
 }
 
@@ -665,6 +667,136 @@ def extract_billetto_links(html: str, base: str) -> list[str]:
     return links
 
 
+def parse_musikens_hus_page(html: str, url: str, today: date | None = None) -> Event | None:
+    soup = BeautifulSoup(html, "html.parser")
+    structured = parse_jsonld_event(soup, "Musikens Hus & Hängmattan", url)
+    if structured:
+        venue_l = (structured.venue or "").lower()
+        if "hängmattan" in venue_l and ("stora" in venue_l or "musikens hus" in venue_l):
+            structured.venue = structured.venue or "Musikens Hus & Hängmattan"
+            structured.address = structured.address or "Djurgårdsgatan 13 / Karl Johansgatan 16"
+            structured.source = "Musikens Hus & Hängmattan"
+        elif "hängmattan" in venue_l:
+            structured.venue = structured.venue or "Hängmattan"
+            structured.address = structured.address or "Karl Johansgatan 16"
+            structured.source = "Hängmattan"
+        else:
+            structured.venue = structured.venue or "Musikens Hus"
+            structured.address = structured.address or "Djurgårdsgatan 13"
+            structured.source = "Musikens Hus"
+        structured.city = structured.city or "Göteborg"
+        return structured
+
+    text = soup_text(soup)
+    d = parse_swedish_date(text, today)
+    if not d:
+        return None
+
+    # Prefer actual performance/start time, then opening time. Some pages only list "Öppet 22.00-02.00".
+    time_patterns = [
+        r"På\s+scen(?:\s+ca)?\s+kl\.?\s*([0-2]?\d[:.]\d{2})",
+        r"Start\s+kl\.?\s*([0-2]?\d[:.]\d{2})",
+        r"Öppet\s*([0-2]?\d[:.]\d{2})\s*[-–]\s*([0-2]?\d[:.]\d{2})",
+        r"Vi\s+öppnar\s+kl\.?\s*([0-2]?\d[:.]\d{2})",
+    ]
+    start_t = None
+    end_t = None
+    for i, pat in enumerate(time_patterns):
+        m = re.search(pat, text, re.I)
+        if not m:
+            continue
+        start_t = parse_hhmm(m.group(1))
+        if i == 2 and m.lastindex and m.lastindex >= 2:
+            end_t = parse_hhmm(m.group(2))
+        if start_t:
+            break
+    if not start_t:
+        # Keep the event even when the organiser has not announced a time yet.
+        start_t = time(19, 0)
+        time_note = "Starttid saknas/TBA på källsidan; 19:00 används som reservtid."
+    else:
+        time_note = ""
+
+    # If a separate end time is stated, use it.
+    if end_t is None:
+        end_m = re.search(r"(?:Slut|Stänger)\s*(?:kl\.?)?\s*([0-2]?\d[:.]\d{2})", text, re.I)
+        end_t = parse_hhmm(end_m.group(1)) if end_m else None
+
+    # Detect the venue immediately after the full event date. This avoids menu/footer text
+    # elsewhere on the page causing a false venue match.
+    venue = "Musikens Hus"
+    address = "Djurgårdsgatan 13"
+    venue_match = re.search(
+        rf"{WEEKDAY_RE}\s+\d{{1,2}}\s+{MONTH_RE}\s+\d{{4}}\s+"
+        r"(Stora\s+scen(?:en)?\s*&\s*Hängmattan(?:\s+Scen)?|Stora\s+scen(?:en)?|Hängmattan(?:\s+Scen)?)",
+        text, re.I,
+    )
+    venue_text = clean_text(venue_match.group(1)).lower() if venue_match else ""
+    if "stora" in venue_text and "hängmattan" in venue_text:
+        venue = "Musikens Hus & Hängmattan"
+        address = "Djurgårdsgatan 13 / Karl Johansgatan 16"
+    elif "hängmattan" in venue_text:
+        venue = "Hängmattan"
+        address = "Karl Johansgatan 16"
+    elif "stora" in venue_text:
+        venue = "Musikens Hus, Stora Scen"
+        address = "Djurgårdsgatan 13"
+    elif re.search(r"Karl\s*Johans?gatan\s*16", text, re.I):
+        venue = "Hängmattan"
+        address = "Karl Johansgatan 16"
+
+    doors = re.search(r"Vi\s+öppnar\s+kl\.?\s*([0-2]?\d[:.]\d{2})", text, re.I)
+    desc_parts = []
+    if doors:
+        desc_parts.append(f"Öppnar {doors.group(1).replace('.', ':')}.")
+    if time_note:
+        desc_parts.append(time_note)
+    start = local_dt(d, start_t)
+    if venue == "Hängmattan":
+        source_name = "Hängmattan"
+    elif "Hängmattan" in venue:
+        source_name = "Musikens Hus & Hängmattan"
+    else:
+        source_name = "Musikens Hus"
+    return Event(
+        title_from_soup(soup),
+        start,
+        sensible_end(start, end_t),
+        venue,
+        address,
+        "Göteborg",
+        source_name,
+        url,
+        " ".join(desc_parts),
+    )
+
+
+def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
+    url = SOURCES["Musikens Hus & Hängmattan"]
+    soup = BeautifulSoup(fetch(session, url).text, "html.parser")
+
+    def pred(href: str, a) -> bool:
+        p = urlparse(href)
+        if p.netloc not in ("www.musikenshus.se", "musikenshus.se"):
+            return False
+        label = clean_text(a.get_text(" ", strip=True)).lower()
+        return label == "läs mer" and p.path not in ("/", "/kalender/")
+
+    links = event_links(soup, url, pred)
+    if not links:
+        raise SourceError("Musikens Hus & Hängmattan gav inga evenemangslänkar från kalendersidan.")
+
+    events: list[Event] = []
+    for link in links[:260]:
+        try:
+            ev = parse_musikens_hus_page(fetch(session, link).text, link, today)
+            if ev:
+                events.append(ev)
+        except Exception as exc:
+            logging.debug("Musikens Hus & Hängmattan event failed %s: %s", link, exc)
+    return deduplicate(events)
+
+
 def parse_billetto_page(html: str, url: str, today: date | None = None) -> Event | None:
     soup = BeautifulSoup(html, "html.parser")
     structured = parse_jsonld_event(soup, "Utopia Jazz", url)
@@ -851,7 +983,7 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
 <style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:.5rem;text-align:left}}th{{background:#f4f4f4}}</style>
 <h1>Jazzkalender</h1>
 <ul><li><a href='alla.ics'>Alla</a></li><li><a href='goteborg.ics'>Göteborg</a></li><li><a href='stockholm.ics'>Stockholm</a></li></ul>
-<p>Kalendrarna uppdateras automatiskt. Senast genererad: {updated}.</p>
+<p>Kalendrarna uppdateras automatiskt. Senast genererad: {updated}. Version: {CALENDAR_VERSION}.</p>
 <h2>Källstatus</h2><table><thead><tr><th>Källa</th><th>Status</th><th>Antal</th><th>Senaste datum</th><th>Kommentar</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 </html>"""
     (output_dir / "index.html").write_text(index, encoding="utf-8")
@@ -865,6 +997,7 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
         ("Playhouse", scrape_playhouse),
         ("Skeppet GBG", scrape_skeppet),
         ("Unity Jazz", scrape_unity),
+        ("Musikens Hus & Hängmattan", scrape_musikens_hus),
         ("Utopia Jazz", scrape_utopia),
     ]
     all_events: list[Event] = []
@@ -888,7 +1021,7 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Samlar sex eventkalendrar till prenumererbara ICS-filer.")
+    ap = argparse.ArgumentParser(description="Samlar sju eventkalendrar till prenumererbara ICS-filer.")
     ap.add_argument("--output-dir", default="public", help="Katalog för genererade filer")
     ap.add_argument("--date", help="Överstyr dagens datum, YYYY-MM-DD, praktiskt för test")
     ap.add_argument("--verbose", action="store_true")
