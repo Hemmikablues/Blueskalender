@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v9-katalin-kungsbacka"
+CALENDAR_VERSION = "2026-08-23-web-v9.1-katalin-kungsbacka-mh-local-cache"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -1385,19 +1385,51 @@ def load_previous_events(session: requests.Session, today: date) -> list[Event]:
         return []
 
 
-def load_mh_source_cache(session: requests.Session, today: date) -> list[Event]:
+def _events_from_cache_payload(raw: Any, today: date) -> list[Event]:
+    if not isinstance(raw, list):
+        return []
+    parsed = [event_from_dict(item) for item in raw if isinstance(item, dict)]
+    events = filter_window([e for e in parsed if e is not None], today)
+    return previous_for_source(events, "Musikens Hus & Hängmattan")
+
+
+def load_mh_source_cache(
+    session: requests.Session,
+    today: date,
+    local_cache_path: Path | None = None,
+) -> list[Event]:
+    """Read the Musikens Hus/Hängmattan cache.
+
+    The checked-in local cache is deliberately tried first. This makes a Pages build
+    independent of whether the previously deployed site can be reached from the same
+    GitHub runner. The published cache URL remains a second fallback.
+    """
+    if local_cache_path and local_cache_path.exists():
+        try:
+            raw = json.loads(local_cache_path.read_text(encoding="utf-8"))
+            events = _events_from_cache_payload(raw, today)
+            if events:
+                logging.info(
+                    "Läste %d Musikens Hus/Hängmattan-poster från lokal cache %s.",
+                    len(events), local_cache_path,
+                )
+                return events
+        except Exception as exc:
+            logging.warning("Den lokala Musikens Hus-cachen kunde inte läsas: %s", exc)
+
     if not MH_CACHE_URL:
         return []
     try:
         response = fetch(session, MH_CACHE_URL, timeout=15)
-        raw = response.json()
-        if not isinstance(raw, list):
-            return []
-        parsed = [event_from_dict(item) for item in raw if isinstance(item, dict)]
-        events = filter_window([e for e in parsed if e is not None], today)
-        return previous_for_source(events, "Musikens Hus & Hängmattan")
+        events = _events_from_cache_payload(response.json(), today)
+        if events:
+            logging.info(
+                "Läste %d Musikens Hus/Hängmattan-poster från publicerad cache.",
+                len(events),
+            )
+        return events
     except Exception as exc:
-        logging.info("Ingen separat Musikens Hus-cache kunde läsas ännu: %s", exc)
+        logging.info("Ingen publicerad Musikens Hus-cache kunde läsas: %s", exc)
         return []
 
 
@@ -1450,7 +1482,7 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
 def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]:
     session = make_session()
     previous = load_previous_events(session, today)
-    mh_source_cache = load_mh_source_cache(session, today)
+    mh_source_cache = load_mh_source_cache(session, today, output_dir / "cache" / "musikens_hus.json")
     if previous:
         logging.info("Läste %d evenemang från föregående publicering som reservdata.", len(previous))
     if mh_source_cache:
