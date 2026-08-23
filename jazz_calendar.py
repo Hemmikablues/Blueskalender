@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v7-mh-stable-cache"
+CALENDAR_VERSION = "2026-08-23-web-v7-musikkalender"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -1045,7 +1045,7 @@ def calendar_text(events: list[Event], name: str) -> str:
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Musikkalender Prototype//SV//EN",
+        "PRODID:-//Jazzkalender Prototype//SV//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
         f"X-WR-CALNAME:{ics_escape(name)}",
@@ -1187,9 +1187,9 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
     output_dir.mkdir(parents=True, exist_ok=True)
     goteborg = [e for e in events if e.city.lower() in ("göteborg", "goteborg", "gothenburg")]
     stockholm = [e for e in events if e.city.lower() == "stockholm"]
-    (output_dir / "alla.ics").write_text(calendar_text(events, "Musikkalender, alla"), encoding="utf-8", newline="")
-    (output_dir / "goteborg.ics").write_text(calendar_text(goteborg, "Musikkalender, Göteborg"), encoding="utf-8", newline="")
-    (output_dir / "stockholm.ics").write_text(calendar_text(stockholm, "Musikkalender, Stockholm"), encoding="utf-8", newline="")
+    (output_dir / "alla.ics").write_text(calendar_text(events, "Jazzkalender, alla"), encoding="utf-8", newline="")
+    (output_dir / "goteborg.ics").write_text(calendar_text(goteborg, "Jazzkalender, Göteborg"), encoding="utf-8", newline="")
+    (output_dir / "stockholm.ics").write_text(calendar_text(stockholm, "Jazzkalender, Stockholm"), encoding="utf-8", newline="")
     payload = [asdict(e) | {"start": e.start.isoformat(), "end": e.end.isoformat()} for e in sorted(events, key=lambda x: (x.start, x.title))]
     (output_dir / "events.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "status.json").write_text(json.dumps([asdict(s) for s in statuses], ensure_ascii=False, indent=2), encoding="utf-8")
