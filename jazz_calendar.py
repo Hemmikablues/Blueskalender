@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v5-mh-proxy"
+CALENDAR_VERSION = "2026-08-23-web-v6-mh-allorigins"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -128,45 +128,42 @@ def fetch(session: requests.Session, url: str, *, timeout: int = 25) -> requests
 
 
 # Musikens Hus svarar periodvis inte alls på anslutningar från GitHubs runners.
-# För just den källan använder vi därför Jina Reader som reservproxy. Reader
-# hämtar originalsidan åt oss och kan returnera samma HTML som vår befintliga
-# parser redan förstår. Ingen API-nyckel krävs för denna låga användning.
-_MH_DIRECT_BROKEN = False
-_READER_LAST_REQUEST = 0.0
+# V6 undviker Jina Reader, eftersom den tjänsten returnerar 403 för denna källa.
+# I stället gör vi bara EN hämtning av kalenderlistan. Om direktanslutningen
+# misslyckas används den öppna AllOrigins-tjänsten som transportreserv.
+# Själva kalenderlistan innehåller datum, scen, titel och länk, så vi behöver
+# inte göra ett proxyanrop per detaljsida. Det minskar både belastning och felrisk.
+_MH_TRANSPORT_FALLBACK = False
 
 
-def fetch_reader_html(session: requests.Session, target_url: str) -> str:
-    global _READER_LAST_REQUEST
-    # Den anonyma Reader-tjänsten har en låg minutkvot. En liten spärr gör att
-    # en hel kalender med många detaljsidor inte skickas som en burst.
-    elapsed = time_module.monotonic() - _READER_LAST_REQUEST
-    if elapsed < 3.2:
-        time_module.sleep(3.2 - elapsed)
-    reader_url = "https://r.jina.ai/" + target_url
-    headers = {
-        "X-Respond-With": "html",
-        "X-Engine": "browser",
-        "X-Cache-Tolerance": "21600",
-        "X-Retain-Images": "none",
-    }
-    r = session.get(reader_url, headers=headers, timeout=75)
-    _READER_LAST_REQUEST = time_module.monotonic()
+def fetch_allorigins_html(session: requests.Session, target_url: str) -> str:
+    proxy_url = "https://api.allorigins.win/raw?url=" + quote(target_url, safe="")
+    r = session.get(proxy_url, timeout=75)
     r.raise_for_status()
-    if not r.text.strip():
-        raise SourceError(f"Reservproxyn gav tomt svar för {target_url}")
-    return r.text
+    text = r.text
+    if not text.strip():
+        raise SourceError(f"AllOrigins gav tomt svar för {target_url}")
+    # Ett lyckat proxysvar ska fortfarande innehålla Musikens Hus kalender.
+    low = text[:20000].lower()
+    if "musikens hus" not in low and "hängmattan" not in low and "kalender" not in low:
+        raise SourceError("AllOrigins svarade, men innehållet ser inte ut som Musikens Hus kalender.")
+    return text
 
 
-def fetch_musikens_hus_html(session: requests.Session, target_url: str, *, allow_direct: bool = True) -> str:
-    global _MH_DIRECT_BROKEN
-    if allow_direct and not _MH_DIRECT_BROKEN:
+def fetch_musikens_hus_index(session: requests.Session, target_url: str) -> str:
+    global _MH_TRANSPORT_FALLBACK
+    direct_errors: list[str] = []
+    # Kalendern först. Startsidan är en extra direktväg om kalender-URL:en tillfälligt strular.
+    for candidate in (target_url, "https://www.musikenshus.se/"):
         try:
-            return fetch(session, target_url, timeout=12).text
+            html = fetch(session, candidate, timeout=15).text
+            _MH_TRANSPORT_FALLBACK = False
+            return html
         except Exception as exc:
-            logging.warning("Direkthämtning från Musikens Hus misslyckades (%s). Provar reservproxy.", exc)
-            _MH_DIRECT_BROKEN = True
-    return fetch_reader_html(session, target_url)
-
+            direct_errors.append(f"{candidate}: {exc}")
+    logging.warning("Direkthämtning från Musikens Hus misslyckades. Provar AllOrigins. %s", " | ".join(direct_errors))
+    _MH_TRANSPORT_FALLBACK = True
+    return fetch_allorigins_html(session, target_url)
 
 def clean_text(value: str) -> str:
     value = html_lib.unescape(value or "")
@@ -815,62 +812,127 @@ def parse_musikens_hus_page(html: str, url: str, today: date | None = None) -> E
     )
 
 
-def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
-    global _MH_DIRECT_BROKEN
-    calendar_url = SOURCES["Musikens Hus & Hängmattan"]
-
-    # Hemsidan visar samma programlista och svarar ibland bättre än /kalender/.
-    # Vi provar båda direkt innan vi går över till reservproxyn.
-    index_html = None
-    index_url = calendar_url
-    direct_errors: list[str] = []
-    for candidate in ("https://www.musikenshus.se/", calendar_url):
-        try:
-            index_html = fetch(session, candidate, timeout=12).text
-            index_url = candidate
-            _MH_DIRECT_BROKEN = False
+def _mh_listing_card(anchor) -> Any | None:
+    """Return the smallest ancestor that looks like one Musikens Hus event card."""
+    for parent in anchor.parents:
+        name = getattr(parent, "name", None)
+        if name in ("body", "html", None):
             break
-        except Exception as exc:
-            direct_errors.append(f"{candidate}: {exc}")
+        text = clean_text(parent.get_text(" ", strip=True))
+        if not (25 <= len(text) <= 3500):
+            continue
+        heading = parent.find(["h1", "h2", "h3"])
+        if heading and parse_swedish_date(text):
+            return parent
+    return anchor.parent
 
-    if index_html is None:
-        _MH_DIRECT_BROKEN = True
-        logging.warning("Musikens Hus svarade inte direkt från GitHub. Använder reservproxy. %s", " | ".join(direct_errors))
-        # Reader kan returnera färdigrenderad HTML och kringgår därmed den
-        # anslutningstimeout som GitHubs runner får mot musikenshus.se.
-        index_html = fetch_reader_html(session, calendar_url)
-        index_url = calendar_url
 
-    soup = BeautifulSoup(index_html, "html.parser")
+def _mh_listing_time(text: str) -> tuple[time, time | None, str]:
+    patterns = [
+        r"På\s+scen(?:\s+ca)?\s+(?:kl\.?\s*)?([0-2]?\d[:.]\d{2})",
+        r"Start(?:ar|tid)?\s*(?:kl\.?\s*)?([0-2]?\d[:.]\d{2})",
+        r"Från\s+([0-2]?\d[:.]\d{2})",
+        r"Öppet\s*(?:kl\.?\s*)?([0-2]?\d[:.]\d{2})(?:\s*[-–]\s*([0-2]?\d[:.]\d{2}))?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if not m:
+            continue
+        st = parse_hhmm(m.group(1))
+        et = parse_hhmm(m.group(2)) if m.lastindex and m.lastindex >= 2 and m.group(2) else None
+        if st:
+            return st, et, ""
+    return time(19, 0), None, "Starttid kunde inte utläsas ur kalenderlistan; 19:00 används som reservtid."
 
-    def pred(href: str, a) -> bool:
-        p = urlparse(href)
-        if p.netloc not in ("www.musikenshus.se", "musikenshus.se"):
-            return False
-        label = clean_text(a.get_text(" ", strip=True)).lower()
-        return label == "läs mer" and p.path not in ("/", "/kalender/")
 
-    links = event_links(soup, index_url, pred)
-    if not links:
-        raise SourceError("Musikens Hus & Hängmattan gav inga evenemangslänkar, varken direkt eller via reservproxy.")
-
+def parse_musikens_hus_listing(html: str, base_url: str, today: date) -> list[Event]:
+    soup = BeautifulSoup(html, "html.parser")
     events: list[Event] = []
-    proxy_failures = 0
-    for link in links[:260]:
-        try:
-            page_html = fetch_musikens_hus_html(session, link, allow_direct=not _MH_DIRECT_BROKEN)
-            ev = parse_musikens_hus_page(page_html, link, today)
-            if ev:
-                events.append(ev)
-        except Exception as exc:
-            proxy_failures += 1
-            logging.debug("Musikens Hus & Hängmattan event failed %s: %s", link, exc)
+    seen_urls: set[str] = set()
 
-    events = deduplicate(events)
+    for a in soup.find_all("a", href=True):
+        label = clean_text(a.get_text(" ", strip=True)).lower()
+        href = urljoin(base_url, a.get("href", ""))
+        p = urlparse(href)
+        if label != "läs mer":
+            continue
+        if p.netloc not in ("www.musikenshus.se", "musikenshus.se"):
+            continue
+        if p.path in ("/", "/kalender/") or href in seen_urls:
+            continue
+
+        card = _mh_listing_card(a)
+        if card is None:
+            continue
+        text = clean_text(card.get_text(" ", strip=True))
+        d = parse_swedish_date(text, today)
+        if not d:
+            # Some themes keep the day/month just outside the clickable card.
+            prev = []
+            node = card
+            for _ in range(7):
+                node = node.find_previous() if node else None
+                if node is None:
+                    break
+                t = clean_text(node.get_text(" ", strip=True)) if hasattr(node, "get_text") else ""
+                if t:
+                    prev.append(t)
+                d = parse_swedish_date(" ".join(reversed(prev)), today)
+                if d:
+                    break
+        if not d:
+            continue
+
+        heading = card.find(["h1", "h2", "h3"])
+        title = clean_text(heading.get_text(" ", strip=True)) if heading else ""
+        if not title or title.lower() in {"kalender", "musikens hus", "hängmattan"}:
+            # The event title is normally the closest heading before the Läs mer link.
+            prev_heading = a.find_previous(["h1", "h2", "h3"])
+            title = clean_text(prev_heading.get_text(" ", strip=True)) if prev_heading else "Evenemang"
+
+        lower = text.lower()
+        if "hängmattan" in lower and ("stora scen" in lower or "stora scenen" in lower):
+            venue = "Musikens Hus & Hängmattan"
+            address = "Djurgårdsgatan 13 / Karl Johansgatan 16"
+            source_name = "Musikens Hus & Hängmattan"
+        elif "hängmattan" in lower:
+            venue = "Hängmattan"
+            address = "Karl Johansgatan 16"
+            source_name = "Hängmattan"
+        elif "stora scen" in lower or "stora scenen" in lower:
+            venue = "Musikens Hus, Stora Scen"
+            address = "Djurgårdsgatan 13"
+            source_name = "Musikens Hus"
+        else:
+            venue = "Musikens Hus"
+            address = "Djurgårdsgatan 13"
+            source_name = "Musikens Hus"
+
+        start_t, end_t, note = _mh_listing_time(text)
+        start = local_dt(d, start_t)
+        events.append(Event(
+            title=title,
+            start=start,
+            end=sensible_end(start, end_t),
+            venue=venue,
+            address=address,
+            city="Göteborg",
+            source=source_name,
+            url=href,
+            description=note,
+        ))
+        seen_urls.add(href)
+
+    return deduplicate(events)
+
+
+def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
+    calendar_url = SOURCES["Musikens Hus & Hängmattan"]
+    index_html = fetch_musikens_hus_index(session, calendar_url)
+    events = parse_musikens_hus_listing(index_html, calendar_url, today)
     if not events:
-        raise SourceError(f"Musikens Hus/Hängmattan kunde läsas men inga detaljsidor kunde tolkas ({proxy_failures} fel).")
+        raise SourceError("Musikens Hus/Hängmattan kunde hämtas men kalenderlistan gav inga tolkbara evenemang.")
     return events
-
 
 def parse_billetto_page(html: str, url: str, today: date | None = None) -> Event | None:
     soup = BeautifulSoup(html, "html.parser")
@@ -1140,7 +1202,10 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
             if events:
                 all_events.extend(events)
                 latest = max(e.start.date() for e in events)
-                statuses.append(SourceStatus(name, True, len(events), latest.isoformat(), "", False))
+                status_message = ""
+                if name == "Musikens Hus & Hängmattan" and _MH_TRANSPORT_FALLBACK:
+                    status_message = "Hämtad via reservtransporten AllOrigins eftersom direktanslutningen från GitHub inte svarade."
+                statuses.append(SourceStatus(name, True, len(events), latest.isoformat(), status_message, False))
                 logging.info("%s: %d evenemang, senaste %s", name, len(events), latest)
             elif prior:
                 all_events.extend(prior)
