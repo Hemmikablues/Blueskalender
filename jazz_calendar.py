@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode, quote
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v6-mh-allorigins"
+CALENDAR_VERSION = "2026-08-23-web-v7-mh-stable-cache"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -128,42 +128,38 @@ def fetch(session: requests.Session, url: str, *, timeout: int = 25) -> requests
 
 
 # Musikens Hus svarar periodvis inte alls på anslutningar från GitHubs runners.
-# V6 undviker Jina Reader, eftersom den tjänsten returnerar 403 för denna källa.
-# I stället gör vi bara EN hämtning av kalenderlistan. Om direktanslutningen
-# misslyckas används den öppna AllOrigins-tjänsten som transportreserv.
-# Själva kalenderlistan innehåller datum, scen, titel och länk, så vi behöver
-# inte göra ett proxyanrop per detaljsida. Det minskar både belastning och felrisk.
+# V7 använder därför INGA publika proxyer. I stället görs flera direkta försök
+# och senaste lyckade Musikens Hus-data sparas separat på GitHub Pages.
+# Vid ett tillfälligt fel används den senast kända källcachen och den skrivs
+# tillbaka vid publicering, så att en misslyckad körning inte kan radera den.
 _MH_TRANSPORT_FALLBACK = False
-
-
-def fetch_allorigins_html(session: requests.Session, target_url: str) -> str:
-    proxy_url = "https://api.allorigins.win/raw?url=" + quote(target_url, safe="")
-    r = session.get(proxy_url, timeout=75)
-    r.raise_for_status()
-    text = r.text
-    if not text.strip():
-        raise SourceError(f"AllOrigins gav tomt svar för {target_url}")
-    # Ett lyckat proxysvar ska fortfarande innehålla Musikens Hus kalender.
-    low = text[:20000].lower()
-    if "musikens hus" not in low and "hängmattan" not in low and "kalender" not in low:
-        raise SourceError("AllOrigins svarade, men innehållet ser inte ut som Musikens Hus kalender.")
-    return text
 
 
 def fetch_musikens_hus_index(session: requests.Session, target_url: str) -> str:
     global _MH_TRANSPORT_FALLBACK
-    direct_errors: list[str] = []
-    # Kalendern först. Startsidan är en extra direktväg om kalender-URL:en tillfälligt strular.
-    for candidate in (target_url, "https://www.musikenshus.se/"):
-        try:
-            html = fetch(session, candidate, timeout=15).text
-            _MH_TRANSPORT_FALLBACK = False
-            return html
-        except Exception as exc:
-            direct_errors.append(f"{candidate}: {exc}")
-    logging.warning("Direkthämtning från Musikens Hus misslyckades. Provar AllOrigins. %s", " | ".join(direct_errors))
-    _MH_TRANSPORT_FALLBACK = True
-    return fetch_allorigins_html(session, target_url)
+    _MH_TRANSPORT_FALLBACK = False
+    candidates = (
+        target_url,
+        "https://www.musikenshus.se/",
+        "https://musikenshus.se/kalender/",
+    )
+    errors: list[str] = []
+    # Två omgångar ger servern en ny chans utan att en körning blir orimligt lång.
+    for round_no in range(2):
+        for candidate in candidates:
+            try:
+                html = fetch(session, candidate, timeout=12).text
+                low = html[:20000].lower()
+                if "hängmattan" not in low and "musikens hus" not in low:
+                    raise SourceError("Svaret ser inte ut som Musikens Hus kalender.")
+                return html
+            except Exception as exc:
+                errors.append(f"{candidate}: {exc}")
+        if round_no == 0:
+            logging.warning("Musikens Hus svarade inte. Väntar 30 sekunder och försöker igen.")
+            time_module.sleep(30)
+    raise SourceError("Direkthämtning från Musikens Hus misslyckades efter upprepade försök: " + " | ".join(errors[-6:]))
+
 
 def clean_text(value: str) -> str:
     value = html_lib.unescape(value or "")
@@ -1107,6 +1103,11 @@ FALLBACK_EVENTS_URL = os.environ.get(
     "https://hemmikablues.github.io/Blueskalender/events.json",
 )
 
+MH_CACHE_URL = os.environ.get(
+    "JAZZ_MH_CACHE_URL",
+    "https://hemmikablues.github.io/Blueskalender/cache/musikens_hus.json",
+)
+
 SOURCE_ALIASES = {
     "Fasching": {"Fasching"},
     "Nefertiti": {"Nefertiti"},
@@ -1147,6 +1148,22 @@ def load_previous_events(session: requests.Session, today: date) -> list[Event]:
         return []
 
 
+def load_mh_source_cache(session: requests.Session, today: date) -> list[Event]:
+    if not MH_CACHE_URL:
+        return []
+    try:
+        response = fetch(session, MH_CACHE_URL, timeout=15)
+        raw = response.json()
+        if not isinstance(raw, list):
+            return []
+        parsed = [event_from_dict(item) for item in raw if isinstance(item, dict)]
+        events = filter_window([e for e in parsed if e is not None], today)
+        return previous_for_source(events, "Musikens Hus & Hängmattan")
+    except Exception as exc:
+        logging.info("Ingen separat Musikens Hus-cache kunde läsas ännu: %s", exc)
+        return []
+
+
 def previous_for_source(previous: list[Event], source_name: str) -> list[Event]:
     aliases = SOURCE_ALIASES.get(source_name, {source_name})
     result = []
@@ -1176,6 +1193,12 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
     payload = [asdict(e) | {"start": e.start.isoformat(), "end": e.end.isoformat()} for e in sorted(events, key=lambda x: (x.start, x.title))]
     (output_dir / "events.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "status.json").write_text(json.dumps([asdict(s) for s in statuses], ensure_ascii=False, indent=2), encoding="utf-8")
+    mh_events = previous_for_source(events, "Musikens Hus & Hängmattan")
+    if mh_events:
+        cache_dir = output_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        mh_payload = [asdict(e) | {"start": e.start.isoformat(), "end": e.end.isoformat()} for e in sorted(mh_events, key=lambda x: (x.start, x.title))]
+        (cache_dir / "musikens_hus.json").write_text(json.dumps(mh_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     updated = datetime.now().strftime("%Y-%m-%d %H:%M")
     (output_dir / "index.html").write_text(web_index(updated), encoding="utf-8")
     (output_dir / "style.css").write_text(WEB_CSS, encoding="utf-8")
@@ -1186,8 +1209,11 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
 def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]:
     session = make_session()
     previous = load_previous_events(session, today)
+    mh_source_cache = load_mh_source_cache(session, today)
     if previous:
         logging.info("Läste %d evenemang från föregående publicering som reservdata.", len(previous))
+    if mh_source_cache:
+        logging.info("Läste %d Musikens Hus/Hängmattan-poster från separat källcache.", len(mh_source_cache))
     scrapers = [
         ("Fasching", scrape_fasching), ("Nefertiti", scrape_nefertiti), ("Playhouse", scrape_playhouse),
         ("Skeppet GBG", scrape_skeppet), ("Unity Jazz", scrape_unity),
@@ -1197,14 +1223,16 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
     statuses: list[SourceStatus] = []
     for name, scraper in scrapers:
         prior = filter_window(previous_for_source(previous, name), today)
+        if name == "Musikens Hus & Hängmattan" and mh_source_cache:
+            # Den separata cachen är avsiktligt starkare än den allmänna events.json-cachen.
+            # Därmed kan en tidigare misslyckad publicering inte radera källans reservdata.
+            prior = filter_window(mh_source_cache, today)
         try:
             events = filter_window(scraper(session, today), today)
             if events:
                 all_events.extend(events)
                 latest = max(e.start.date() for e in events)
                 status_message = ""
-                if name == "Musikens Hus & Hängmattan" and _MH_TRANSPORT_FALLBACK:
-                    status_message = "Hämtad via reservtransporten AllOrigins eftersom direktanslutningen från GitHub inte svarade."
                 statuses.append(SourceStatus(name, True, len(events), latest.isoformat(), status_message, False))
                 logging.info("%s: %d evenemang, senaste %s", name, len(events), latest)
             elif prior:
