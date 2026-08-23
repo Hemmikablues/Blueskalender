@@ -85,6 +85,7 @@ class SourceStatus:
     source: str
     ok: bool
     count: int
+    latest: str = ""
     message: str = ""
 
 
@@ -292,36 +293,85 @@ def parse_fasching_page(html: str, url: str, today: date | None = None) -> Event
     return Event(title_from_soup(soup), start, sensible_end(start), "Fasching", "Kungsgatan 63", "Stockholm", "Fasching", url, desc)
 
 
+def parse_fasching_events_page(html: str, url: str, today: date | None = None) -> list[Event]:
+    """Parse one Fasching page, including pages that contain several performance dates."""
+    today = today or date.today()
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup_text(soup)
+    title = title_from_soup(soup)
+    events: list[Event] = []
+
+    # Fasching sometimes puts several dates on one artist page. Parse every Datum/Tider block.
+    starts = [m.start() for m in re.finditer(r"\bDatum\s+", text, re.I)]
+    if starts:
+        starts.append(len(text))
+        for i in range(len(starts) - 1):
+            block = text[starts[i]:starts[i + 1]]
+            d = parse_swedish_date(block, today)
+            tm = re.search(r"På scen\s*:?\s*([0-2]?\d[:.]\d{2})", block, re.I)
+            if not d or not tm:
+                continue
+            start_t = parse_hhmm(tm.group(1))
+            if not start_t:
+                continue
+            doors = re.search(r"Dörrarna öppnar\s*:?\s*([0-2]?\d[:.]\d{2})", block, re.I)
+            desc = f"Dörrarna öppnar {doors.group(1).replace('.', ':')}." if doors else ""
+            start = local_dt(d, start_t)
+            events.append(Event(title, start, sensible_end(start), "Fasching", "Kungsgatan 63", "Stockholm", "Fasching", url, desc))
+    if events:
+        return events
+
+    ev = parse_fasching_page(html, url, today)
+    return [ev] if ev else []
+
+
 def scrape_fasching(session: requests.Session, today: date) -> list[Event]:
-    url = SOURCES["Fasching"]
-    soup = BeautifulSoup(fetch(session, url).text, "html.parser")
-
-    def pred(href: str, a) -> bool:
-        p = urlparse(href)
-        if p.netloc not in ("www.fasching.se", "fasching.se"):
-            return False
-        if re.search(r"-20\d{2}-\d{2}-\d{2}/?$", p.path):
-            return True
-        ancestor = a
-        for _ in range(4):
-            ancestor = ancestor.parent
-            if ancestor is None:
-                break
-            txt = clean_text(ancestor.get_text(" ", strip=True)).lower()
-            if re.search(rf"\b{WEEKDAY_RE}\s+\d{{1,2}}\s+{MONTH_RE}\b", txt, re.I):
-                return p.path.count("/") <= 2 and p.path not in ("/", "/kalendarium/")
-        return False
-
-    links = event_links(soup, url, pred)
-    events = []
-    for link in links[:120]:
+    # The main kalendarium is dynamically loaded and can expose only the first few shows
+    # to a non-browser client. The stage pages contain the full future programme.
+    index_urls = [
+        "https://www.fasching.se/scen/stora-scen/",
+        "https://www.fasching.se/scen/foajebaren/",
+        SOURCES["Fasching"],
+    ]
+    links: list[str] = []
+    for index_url in index_urls:
         try:
-            ev = parse_fasching_page(fetch(session, link).text, link, today)
-            if ev:
-                events.append(ev)
+            soup = BeautifulSoup(fetch(session, index_url).text, "html.parser")
+        except Exception as exc:
+            logging.debug("Fasching index failed %s: %s", index_url, exc)
+            continue
+
+        def pred(href: str, a) -> bool:
+            p = urlparse(href)
+            if p.netloc not in ("www.fasching.se", "fasching.se"):
+                return False
+            if p.path.startswith("/en/") or p.path.startswith("/scen/") or p.path == "/kalendarium/":
+                return False
+            if re.search(r"-20\d{2}-\d{2}-\d{2}/?$", p.path):
+                return True
+            ancestor = a
+            for _ in range(5):
+                ancestor = ancestor.parent
+                if ancestor is None:
+                    break
+                txt = clean_text(ancestor.get_text(" ", strip=True)).lower()
+                if re.search(rf"\b{WEEKDAY_RE}\s+\d{{1,2}}\s+{MONTH_RE}\b", txt, re.I):
+                    return p.path.count("/") <= 2 and p.path not in ("/", "/kalendarium/")
+            return False
+
+        for link in event_links(soup, index_url, pred):
+            if link not in links:
+                links.append(link)
+
+    if not links:
+        raise SourceError("Fasching gav inga evenemangslänkar från scen- eller kalendariumsidorna.")
+    events: list[Event] = []
+    for link in links[:260]:
+        try:
+            events.extend(parse_fasching_events_page(fetch(session, link).text, link, today))
         except Exception as exc:
             logging.debug("Fasching event failed %s: %s", link, exc)
-    return events
+    return deduplicate(events)
 
 
 def parse_nefertiti_page(html: str, url: str, today: date | None = None) -> Event | None:
@@ -348,19 +398,55 @@ def parse_nefertiti_page(html: str, url: str, today: date | None = None) -> Even
     return Event(title_from_soup(soup), start, sensible_end(start, end_t), "Nefertiti", "Hvitfeldtsplatsen 6", "Göteborg", "Nefertiti", url, desc)
 
 
+def nefertiti_listing_fallback(soup: BeautifulSoup, base: str, today: date) -> dict[str, Event]:
+    """Build date/title fallback records from the calendar listing if detail pages are bot-blocked."""
+    fallback: dict[str, Event] = {}
+    for a in soup.find_all("a", href=True):
+        link = urljoin(base, a["href"]).split("#", 1)[0]
+        if "/nefertiti_event/" not in urlparse(link).path:
+            continue
+        title = clean_text(a.get_text(" ", strip=True))
+        if not title or title.lower() in ("läs mer", "kop biljett", "köp biljett"):
+            continue
+        d = None
+        ancestor = a
+        for _ in range(5):
+            ancestor = ancestor.parent
+            if ancestor is None:
+                break
+            d = parse_swedish_date(clean_text(ancestor.get_text(" ", strip=True)), today)
+            if d:
+                break
+        if not d:
+            continue
+        start = local_dt(d, time(19, 0))
+        fallback[link] = Event(
+            title, start, sensible_end(start, time(23, 0)),
+            "Nefertiti", "Hvitfeldtsplatsen 6", "Göteborg", "Nefertiti", link,
+            "Reservpost från kalendariet. Scenstart kunde inte verifieras på detaljsidan; 19:00 används som reservtid."
+        )
+    return fallback
+
+
 def scrape_nefertiti(session: requests.Session, today: date) -> list[Event]:
     url = SOURCES["Nefertiti"]
     soup = BeautifulSoup(fetch(session, url).text, "html.parser")
     links = event_links(soup, url, lambda href, a: "/nefertiti_event/" in urlparse(href).path)
-    events = []
-    for link in links[:160]:
+    fallback = nefertiti_listing_fallback(soup, url, today)
+    events: list[Event] = []
+    for link in links[:220]:
         try:
             ev = parse_nefertiti_page(fetch(session, link).text, link, today)
             if ev:
                 events.append(ev)
+                continue
         except Exception as exc:
-            logging.debug("Nefertiti event failed %s: %s", link, exc)
-    return events
+            logging.debug("Nefertiti detail failed %s: %s", link, exc)
+        if link in fallback:
+            events.append(fallback[link])
+    if not events and fallback:
+        events.extend(fallback.values())
+    return deduplicate(events)
 
 
 def parse_playhouse_page(html: str, url: str, today: date | None = None) -> Event | None:
@@ -756,10 +842,18 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
     (output_dir / "stockholm.ics").write_text(calendar_text(stockholm, "Jazzkalender, Stockholm"), encoding="utf-8", newline="")
     (output_dir / "events.json").write_text(json.dumps([asdict(e) | {"start": e.start.isoformat(), "end": e.end.isoformat()} for e in events], ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "status.json").write_text(json.dumps([asdict(s) for s in statuses], ensure_ascii=False, indent=2), encoding="utf-8")
-    index = """<!doctype html><meta charset='utf-8'><title>Jazzkalender</title>
+    rows = []
+    for st in statuses:
+        label = "OK" if st.ok else "FEL/VARNING"
+        rows.append(f"<tr><td>{html_lib.escape(st.source)}</td><td>{label}</td><td>{st.count}</td><td>{html_lib.escape(st.latest or '—')}</td><td>{html_lib.escape(st.message or '')}</td></tr>")
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    index = f"""<!doctype html><html lang='sv'><meta charset='utf-8'><title>Jazzkalender</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:.5rem;text-align:left}}th{{background:#f4f4f4}}</style>
 <h1>Jazzkalender</h1>
 <ul><li><a href='alla.ics'>Alla</a></li><li><a href='goteborg.ics'>Göteborg</a></li><li><a href='stockholm.ics'>Stockholm</a></li></ul>
-<p>Kalendrarna uppdateras automatiskt.</p>"""
+<p>Kalendrarna uppdateras automatiskt. Senast genererad: {updated}.</p>
+<h2>Källstatus</h2><table><thead><tr><th>Källa</th><th>Status</th><th>Antal</th><th>Senaste datum</th><th>Kommentar</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+</html>"""
     (output_dir / "index.html").write_text(index, encoding="utf-8")
 
 
@@ -780,10 +874,13 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
             events = scraper(session, today)
             events = filter_window(events, today)
             all_events.extend(events)
-            statuses.append(SourceStatus(name, True, len(events), ""))
-            logging.info("%s: %d evenemang", name, len(events))
+            latest = max((e.start.date() for e in events), default=None)
+            ok_source = len(events) > 0
+            message = "" if ok_source else "Inga framtida evenemang hittades. Kontrollera källan."
+            statuses.append(SourceStatus(name, ok_source, len(events), latest.isoformat() if latest else "", message))
+            logging.info("%s: %d evenemang, senaste %s", name, len(events), latest or "—")
         except Exception as exc:
-            statuses.append(SourceStatus(name, False, 0, str(exc)))
+            statuses.append(SourceStatus(name, False, 0, "", str(exc)))
             logging.warning("%s misslyckades: %s", name, exc)
     all_events = deduplicate(filter_window(all_events, today))
     write_outputs(all_events, statuses, output_dir)
