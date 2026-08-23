@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v8-oceanen-fyren-linne"
+CALENDAR_VERSION = "2026-08-23-web-v7-mh-stable-cache"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -39,9 +39,6 @@ SOURCES = {
     "Skeppet GBG": "https://www.skeppetgbg.se/?post_type=tribe_events",
     "Unity Jazz": "https://www.unityjazz.se/program",
     "Musikens Hus & Hängmattan": "https://www.musikenshus.se/kalender/",
-    "Oceanen": "https://www.oceanen.com/",
-    "Fyrens Ölkafé": "https://radar.promogogo.com/fyrens-olkafe/artist/3d925446-a424-4cf9-af60-d96cf878aa01",
-    "Linnéterrassen": "https://www.linnekrogen.se/s-projects-side-by-side",
     "Utopia Jazz": "https://billetto.se/users/utopia-jazz",
 }
 
@@ -991,203 +988,6 @@ def scrape_utopia(session: requests.Session, today: date) -> list[Event]:
     return events
 
 
-
-def parse_oceanen_index(html: str, base_url: str, today: date) -> list[Event]:
-    """Parse Oceanen's calendar links from the public front page.
-
-    The link text currently follows e.g. "fredag 28 augusti 20:00 Tissilawen (DZA)".
-    Parsing the listing avoids one request per event and is therefore deliberately preferred.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    events: list[Event] = []
-    seen: set[str] = set()
-    prefix_re = re.compile(
-        rf"^\s*{WEEKDAY_RE}\s+(\d{{1,2}})\s+({MONTH_RE})(?:\s+(\d{{4}}))?\s+([0-2]?\d[:.]\d{{2}})\s+(.+?)\s*$",
-        re.I,
-    )
-    for a in soup.find_all("a", href=True):
-        text = clean_text(a.get_text(" ", strip=True))
-        href = urljoin(base_url, a.get("href", ""))
-        if not text or href in seen:
-            continue
-        parsed = urlparse(href)
-        if parsed.netloc not in ("oceanen.com", "www.oceanen.com") or "/event/" not in parsed.path:
-            continue
-        m = prefix_re.match(text)
-        if not m:
-            continue
-        day = int(m.group(1))
-        month = MONTHS[m.group(2).lower()]
-        year = int(m.group(3)) if m.group(3) else infer_year(day, month, today)
-        try:
-            d = date(year, month, day)
-        except ValueError:
-            continue
-        start_t = parse_hhmm(m.group(4))
-        title = clean_text(m.group(5))
-        if not start_t or not title:
-            continue
-        start = local_dt(d, start_t)
-        events.append(Event(
-            title=title,
-            start=start,
-            end=start + timedelta(hours=4),
-            venue="Oceanen",
-            address="Stigbergstorget 8",
-            city="Göteborg",
-            source="Oceanen",
-            url=href,
-        ))
-        seen.add(href)
-    return deduplicate(events)
-
-
-def scrape_oceanen(session: requests.Session, today: date) -> list[Event]:
-    url = SOURCES["Oceanen"]
-    events = parse_oceanen_index(fetch(session, url).text, url, today)
-    if not events:
-        raise SourceError("Oceanens startsida gav inga tolkbara kalenderposter.")
-    return events
-
-
-def parse_fyren_event_page(html: str, url: str, today: date) -> Event | None:
-    soup = BeautifulSoup(html, "html.parser")
-    structured = parse_jsonld_event(soup, "Fyrens Ölkafé", url)
-    if structured:
-        structured.source = "Fyrens Ölkafé"
-        structured.venue = "Fyrens Ölkafé"
-        structured.address = structured.address or "Stigbergstorget 1"
-        structured.city = "Göteborg"
-        return structured
-
-    text = soup_text(soup)
-    # PromoGoGo/Radar currently exposes dates as: Fri 28.08.2026 19:00
-    m = re.search(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\s+([0-2]?\d[:.]\d{2})\b", text, re.I)
-    if not m:
-        return None
-    try:
-        d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-    except ValueError:
-        return None
-    start_t = parse_hhmm(m.group(4))
-    if not start_t:
-        return None
-    start = local_dt(d, start_t)
-    title = title_from_soup(soup)
-    # Keep the useful event description but avoid copying navigation/footer noise.
-    description = ""
-    main = soup.find("main")
-    if main:
-        description = clean_text(main.get_text(" ", strip=True))[:1800]
-    return Event(
-        title=title,
-        start=start,
-        end=start + timedelta(hours=4),
-        venue="Fyrens Ölkafé",
-        address="Stigbergstorget 1",
-        city="Göteborg",
-        source="Fyrens Ölkafé",
-        url=url,
-        description=description,
-    )
-
-
-def scrape_fyren(session: requests.Session, today: date) -> list[Event]:
-    index_url = SOURCES["Fyrens Ölkafé"]
-    soup = BeautifulSoup(fetch(session, index_url).text, "html.parser")
-    links: list[str] = []
-    for a in soup.find_all("a", href=True):
-        href = urljoin(index_url, a.get("href", ""))
-        p = urlparse(href)
-        if p.netloc == "radar.promogogo.com" and p.path.startswith("/event/") and href not in links:
-            links.append(href)
-    if not links:
-        raise SourceError("Fyrens Ölkafés Radar-sida gav inga eventlänkar.")
-    events: list[Event] = []
-    for link in links[:100]:
-        try:
-            ev = parse_fyren_event_page(fetch(session, link).text, link, today)
-            if ev:
-                events.append(ev)
-        except Exception as exc:
-            logging.debug("Fyren event failed %s: %s", link, exc)
-    if not events:
-        raise SourceError("Fyrens Ölkafé hade eventlänkar men inga event kunde tolkas.")
-    return deduplicate(events)
-
-
-def _parse_numeric_date(text: str, today: date) -> date | None:
-    # Conservative numeric parser. A date without an explicit year is only accepted
-    # when the same link also contains a clock time, which prevents opening hours
-    # and old prose on Linnékrogen from becoming calendar events.
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
-    if not m:
-        return None
-    day, month = int(m.group(1)), int(m.group(2))
-    year_raw = m.group(3)
-    if year_raw:
-        year = int(year_raw)
-        if year < 100:
-            year += 2000
-    else:
-        try:
-            year = infer_year(day, month, today)
-        except ValueError:
-            return None
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
-
-
-def parse_linneterrassen_page(html: str, base_url: str, today: date) -> list[Event]:
-    """Conservative parser for Linnéterrassen/Linnékrogen.
-
-    Their current page announces live music but does not publish individual autumn
-    dates yet. We therefore only create events from clickable text that itself has
-    both a date and a clock time, avoiding fabricated recurring events.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    events: list[Event] = []
-    seen: set[tuple[str, datetime]] = set()
-    for a in soup.find_all("a", href=True):
-        text = clean_text(a.get_text(" ", strip=True))
-        if not text:
-            continue
-        start_t = parse_hhmm(text)
-        if not start_t:
-            continue
-        d = parse_swedish_date(text, today) or _parse_numeric_date(text, today)
-        if not d:
-            continue
-        start = local_dt(d, start_t)
-        if start.date() < today - timedelta(days=1):
-            continue
-        # Remove the date/time prefix if possible. Otherwise use the entire link text.
-        title = re.sub(rf"^\s*{WEEKDAY_RE}\s+\d{{1,2}}\s+{MONTH_RE}(?:\s+\d{{4}})?\s+[0-2]?\d[:.]\d{{2}}\s*[-–:]?\s*", "", text, flags=re.I)
-        title = re.sub(r"^\s*\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\s+[0-2]?\d[:.]\d{2}\s*[-–:]?\s*", "", title)
-        title = clean_text(title) or "Livemusik"
-        key = (normalize_title(title), start)
-        if key in seen:
-            continue
-        seen.add(key)
-        events.append(Event(
-            title=title,
-            start=start,
-            end=start + timedelta(hours=3),
-            venue="Linnéterrassen / Linnékrogen",
-            address="Linnégatan 32",
-            city="Göteborg",
-            source="Linnéterrassen",
-            url=urljoin(base_url, a.get("href", "")) or base_url,
-        ))
-    return deduplicate(events)
-
-
-def scrape_linneterrassen(session: requests.Session, today: date) -> list[Event]:
-    url = SOURCES["Linnéterrassen"]
-    return parse_linneterrassen_page(fetch(session, url).text, url, today)
-
 def normalize_title(title: str) -> str:
     t = unicodedata.normalize("NFKD", title.lower())
     t = "".join(ch for ch in t if not unicodedata.combining(ch))
@@ -1415,16 +1215,13 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
     if mh_source_cache:
         logging.info("Läste %d Musikens Hus/Hängmattan-poster från separat källcache.", len(mh_source_cache))
     scrapers = [
-        ("Fasching", scrape_fasching, False), ("Nefertiti", scrape_nefertiti, False), ("Playhouse", scrape_playhouse, False),
-        ("Skeppet GBG", scrape_skeppet, False), ("Unity Jazz", scrape_unity, False),
-        ("Musikens Hus & Hängmattan", scrape_musikens_hus, False),
-        ("Oceanen", scrape_oceanen, False), ("Fyrens Ölkafé", scrape_fyren, False),
-        ("Linnéterrassen", scrape_linneterrassen, True),
-        ("Utopia Jazz", scrape_utopia, False),
+        ("Fasching", scrape_fasching), ("Nefertiti", scrape_nefertiti), ("Playhouse", scrape_playhouse),
+        ("Skeppet GBG", scrape_skeppet), ("Unity Jazz", scrape_unity),
+        ("Musikens Hus & Hängmattan", scrape_musikens_hus), ("Utopia Jazz", scrape_utopia),
     ]
     all_events: list[Event] = []
     statuses: list[SourceStatus] = []
-    for name, scraper, allow_empty in scrapers:
+    for name, scraper in scrapers:
         prior = filter_window(previous_for_source(previous, name), today)
         if name == "Musikens Hus & Hängmattan" and mh_source_cache:
             # Den separata cachen är avsiktligt starkare än den allmänna events.json-cachen.
@@ -1444,10 +1241,6 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
                 msg = f"Senaste hämtningen gav 0 evenemang. Visar {len(prior)} senast kända poster från föregående publicering."
                 statuses.append(SourceStatus(name, False, len(prior), latest.isoformat(), msg, True))
                 logging.warning("%s: använder reservdata (%d evenemang)", name, len(prior))
-            elif allow_empty:
-                msg = "Källan är aktiv men har ännu inget individuellt framtida program som går att läsa automatiskt."
-                statuses.append(SourceStatus(name, True, 0, "", msg, False))
-                logging.info("%s: aktiv källa, men inga publicerade individuella event ännu.", name)
             else:
                 statuses.append(SourceStatus(name, False, 0, "", "Inga framtida evenemang hittades. Kontrollera källan.", False))
         except Exception as exc:
@@ -1465,7 +1258,7 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
     return all_events, statuses
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Samlar eventkalendrar till prenumererbara ICS-filer och webbsida.")
+    ap = argparse.ArgumentParser(description="Samlar sju eventkalendrar till prenumererbara ICS-filer.")
     ap.add_argument("--output-dir", default="public", help="Katalog för genererade filer")
     ap.add_argument("--date", help="Överstyr dagens datum, YYYY-MM-DD, praktiskt för test")
     ap.add_argument("--verbose", action="store_true")
