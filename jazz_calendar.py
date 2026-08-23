@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import time as time_module
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -24,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v4"
+CALENDAR_VERSION = "2026-08-23-web-v5-mh-proxy"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -124,6 +125,47 @@ def fetch(session: requests.Session, url: str, *, timeout: int = 25) -> requests
     if blocked:
         raise SourceError(f"Bot-skydd blockerade hämtningen: {url}")
     return r
+
+
+# Musikens Hus svarar periodvis inte alls på anslutningar från GitHubs runners.
+# För just den källan använder vi därför Jina Reader som reservproxy. Reader
+# hämtar originalsidan åt oss och kan returnera samma HTML som vår befintliga
+# parser redan förstår. Ingen API-nyckel krävs för denna låga användning.
+_MH_DIRECT_BROKEN = False
+_READER_LAST_REQUEST = 0.0
+
+
+def fetch_reader_html(session: requests.Session, target_url: str) -> str:
+    global _READER_LAST_REQUEST
+    # Den anonyma Reader-tjänsten har en låg minutkvot. En liten spärr gör att
+    # en hel kalender med många detaljsidor inte skickas som en burst.
+    elapsed = time_module.monotonic() - _READER_LAST_REQUEST
+    if elapsed < 3.2:
+        time_module.sleep(3.2 - elapsed)
+    reader_url = "https://r.jina.ai/" + target_url
+    headers = {
+        "X-Respond-With": "html",
+        "X-Engine": "browser",
+        "X-Cache-Tolerance": "21600",
+        "X-Retain-Images": "none",
+    }
+    r = session.get(reader_url, headers=headers, timeout=75)
+    _READER_LAST_REQUEST = time_module.monotonic()
+    r.raise_for_status()
+    if not r.text.strip():
+        raise SourceError(f"Reservproxyn gav tomt svar för {target_url}")
+    return r.text
+
+
+def fetch_musikens_hus_html(session: requests.Session, target_url: str, *, allow_direct: bool = True) -> str:
+    global _MH_DIRECT_BROKEN
+    if allow_direct and not _MH_DIRECT_BROKEN:
+        try:
+            return fetch(session, target_url, timeout=12).text
+        except Exception as exc:
+            logging.warning("Direkthämtning från Musikens Hus misslyckades (%s). Provar reservproxy.", exc)
+            _MH_DIRECT_BROKEN = True
+    return fetch_reader_html(session, target_url)
 
 
 def clean_text(value: str) -> str:
@@ -774,8 +816,32 @@ def parse_musikens_hus_page(html: str, url: str, today: date | None = None) -> E
 
 
 def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
-    url = SOURCES["Musikens Hus & Hängmattan"]
-    soup = BeautifulSoup(fetch(session, url).text, "html.parser")
+    global _MH_DIRECT_BROKEN
+    calendar_url = SOURCES["Musikens Hus & Hängmattan"]
+
+    # Hemsidan visar samma programlista och svarar ibland bättre än /kalender/.
+    # Vi provar båda direkt innan vi går över till reservproxyn.
+    index_html = None
+    index_url = calendar_url
+    direct_errors: list[str] = []
+    for candidate in ("https://www.musikenshus.se/", calendar_url):
+        try:
+            index_html = fetch(session, candidate, timeout=12).text
+            index_url = candidate
+            _MH_DIRECT_BROKEN = False
+            break
+        except Exception as exc:
+            direct_errors.append(f"{candidate}: {exc}")
+
+    if index_html is None:
+        _MH_DIRECT_BROKEN = True
+        logging.warning("Musikens Hus svarade inte direkt från GitHub. Använder reservproxy. %s", " | ".join(direct_errors))
+        # Reader kan returnera färdigrenderad HTML och kringgår därmed den
+        # anslutningstimeout som GitHubs runner får mot musikenshus.se.
+        index_html = fetch_reader_html(session, calendar_url)
+        index_url = calendar_url
+
+    soup = BeautifulSoup(index_html, "html.parser")
 
     def pred(href: str, a) -> bool:
         p = urlparse(href)
@@ -784,19 +850,26 @@ def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
         label = clean_text(a.get_text(" ", strip=True)).lower()
         return label == "läs mer" and p.path not in ("/", "/kalender/")
 
-    links = event_links(soup, url, pred)
+    links = event_links(soup, index_url, pred)
     if not links:
-        raise SourceError("Musikens Hus & Hängmattan gav inga evenemangslänkar från kalendersidan.")
+        raise SourceError("Musikens Hus & Hängmattan gav inga evenemangslänkar, varken direkt eller via reservproxy.")
 
     events: list[Event] = []
+    proxy_failures = 0
     for link in links[:260]:
         try:
-            ev = parse_musikens_hus_page(fetch(session, link).text, link, today)
+            page_html = fetch_musikens_hus_html(session, link, allow_direct=not _MH_DIRECT_BROKEN)
+            ev = parse_musikens_hus_page(page_html, link, today)
             if ev:
                 events.append(ev)
         except Exception as exc:
+            proxy_failures += 1
             logging.debug("Musikens Hus & Hängmattan event failed %s: %s", link, exc)
-    return deduplicate(events)
+
+    events = deduplicate(events)
+    if not events:
+        raise SourceError(f"Musikens Hus/Hängmattan kunde läsas men inga detaljsidor kunde tolkas ({proxy_failures} fel).")
+    return events
 
 
 def parse_billetto_page(html: str, url: str, today: date | None = None) -> Event | None:
