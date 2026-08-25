@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-25-web-v9.2-pustervik-mh-local-cache"
+CALENDAR_VERSION = "2026-08-25-web-v9.3-pustervik-separate-mh-hangmattan"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -38,7 +38,8 @@ SOURCES = {
     "Playhouse": "https://playhouse.nu/program/",
     "Skeppet GBG": "https://www.skeppetgbg.se/?post_type=tribe_events",
     "Unity Jazz": "https://www.unityjazz.se/program",
-    "Musikens Hus & Hängmattan": "https://www.musikenshus.se/kalender/",
+    "Musikens Hus": "https://www.musikenshus.se/kalender/",
+    "Hängmattan": "https://www.musikenshus.se/kalender/",
     "Utopia Jazz": "https://billetto.se/users/utopia-jazz",
     "Katalin": "https://www.katalin.com/events/",
     "Jazz & Blues i Kungsbacka": "https://www.jazzoblues.se/",
@@ -709,13 +710,15 @@ def extract_billetto_links(html: str, base: str) -> list[str]:
 
 def parse_musikens_hus_page(html: str, url: str, today: date | None = None) -> Event | None:
     soup = BeautifulSoup(html, "html.parser")
-    structured = parse_jsonld_event(soup, "Musikens Hus & Hängmattan", url)
+    structured = parse_jsonld_event(soup, "Musikens Hus", url)
     if structured:
         venue_l = (structured.venue or "").lower()
         if "hängmattan" in venue_l and ("stora" in venue_l or "musikens hus" in venue_l):
+            # Gemensamma arrangemang klassificeras under Musikens Hus, men spelplatsen
+            # får fortfarande visa att både Musikens Hus och Hängmattan berörs.
             structured.venue = structured.venue or "Musikens Hus & Hängmattan"
             structured.address = structured.address or "Djurgårdsgatan 13 / Karl Johansgatan 16"
-            structured.source = "Musikens Hus & Hängmattan"
+            structured.source = "Musikens Hus"
         elif "hängmattan" in venue_l:
             structured.venue = structured.venue or "Hängmattan"
             structured.address = structured.address or "Karl Johansgatan 16"
@@ -794,9 +797,9 @@ def parse_musikens_hus_page(html: str, url: str, today: date | None = None) -> E
     start = local_dt(d, start_t)
     if venue == "Hängmattan":
         source_name = "Hängmattan"
-    elif "Hängmattan" in venue:
-        source_name = "Musikens Hus & Hängmattan"
     else:
+        # Även ett event som uttryckligen omfattar båda scenerna får en enda
+        # arrangörskategori, så att webbfiltret inte skapar ett tredje val.
         source_name = "Musikens Hus"
     return Event(
         title_from_soup(soup),
@@ -893,7 +896,7 @@ def parse_musikens_hus_listing(html: str, base_url: str, today: date) -> list[Ev
         if "hängmattan" in lower and ("stora scen" in lower or "stora scenen" in lower):
             venue = "Musikens Hus & Hängmattan"
             address = "Djurgårdsgatan 13 / Karl Johansgatan 16"
-            source_name = "Musikens Hus & Hängmattan"
+            source_name = "Musikens Hus"
         elif "hängmattan" in lower:
             venue = "Hängmattan"
             address = "Karl Johansgatan 16"
@@ -926,7 +929,7 @@ def parse_musikens_hus_listing(html: str, base_url: str, today: date) -> list[Ev
 
 
 def scrape_musikens_hus(session: requests.Session, today: date) -> list[Event]:
-    calendar_url = SOURCES["Musikens Hus & Hängmattan"]
+    calendar_url = SOURCES["Musikens Hus"]
     index_html = fetch_musikens_hus_index(session, calendar_url)
     events = parse_musikens_hus_listing(index_html, calendar_url, today)
     if not events:
@@ -1460,12 +1463,63 @@ SOURCE_ALIASES = {
     "Playhouse": {"Playhouse"},
     "Skeppet GBG": {"Skeppet GBG"},
     "Unity Jazz": {"Unity Jazz"},
-    "Musikens Hus & Hängmattan": {"Musikens Hus", "Hängmattan", "Musikens Hus & Hängmattan"},
+    # Den gamla kombinerade etiketten finns kvar endast som bakåtkompatibel alias
+    # för äldre events.json/cache-filer. Nya event får alltid en av de två separata källorna.
+    "Musikens Hus": {"Musikens Hus", "Musikens Hus & Hängmattan"},
+    "Hängmattan": {"Hängmattan"},
+    "Musikens Hus-kalender": {"Musikens Hus", "Hängmattan", "Musikens Hus & Hängmattan"},
     "Utopia Jazz": {"Utopia Jazz"},
     "Katalin": {"Katalin"},
     "Jazz & Blues i Kungsbacka": {"Jazz & Blues i Kungsbacka"},
     "Pustervik": {"Pustervik"},
 }
+
+
+def normalize_mh_event_source(event: Event) -> Event:
+    """Map legacy/combined Musikens Hus labels to exactly one visible source.
+
+    Hängmattan is selected when the venue is clearly Hängmattan. Joint venue
+    labels are classified under Musikens Hus to avoid a third arranger filter.
+    """
+    source_l = (event.source or "").lower()
+    venue_l = (event.venue or "").lower()
+    address_l = (event.address or "").lower()
+    touches_mh = (
+        "musikens hus" in source_l or "hängmattan" in source_l
+        or "musikens hus" in venue_l or "hängmattan" in venue_l
+        or "djurgårdsgatan 13" in address_l or "karl johansgatan 16" in address_l
+    )
+    if not touches_mh:
+        return event
+
+    only_hangmattan_venue = (
+        "hängmattan" in venue_l
+        and "musikens hus" not in venue_l
+        and "stora scen" not in venue_l
+    )
+    only_hangmattan_address = (
+        "karl johansgatan 16" in address_l
+        and "djurgårdsgatan 13" not in address_l
+    )
+    if only_hangmattan_venue or only_hangmattan_address:
+        event.source = "Hängmattan"
+    else:
+        event.source = "Musikens Hus"
+    return event
+
+
+def normalize_mh_sources(events: list[Event]) -> list[Event]:
+    return [normalize_mh_event_source(event) for event in events]
+
+
+def mh_group_events(events: list[Event]) -> list[Event]:
+    """Return both Musikens Hus and Hängmattan events, including legacy labels."""
+    result: list[Event] = []
+    for event in events:
+        parts = {part.strip() for part in (event.source or "").split(" + ") if part.strip()}
+        if parts & {"Musikens Hus", "Hängmattan", "Musikens Hus & Hängmattan"}:
+            result.append(normalize_mh_event_source(event))
+    return result
 
 
 def event_from_dict(data: dict[str, Any]) -> Event | None:
@@ -1502,7 +1556,7 @@ def _events_from_cache_payload(raw: Any, today: date) -> list[Event]:
         return []
     parsed = [event_from_dict(item) for item in raw if isinstance(item, dict)]
     events = filter_window([e for e in parsed if e is not None], today)
-    return previous_for_source(events, "Musikens Hus & Hängmattan")
+    return mh_group_events(events)
 
 
 def load_mh_source_cache(
@@ -1578,7 +1632,7 @@ def write_outputs(events: list[Event], statuses: list[SourceStatus], output_dir:
     payload = [asdict(e) | {"start": e.start.isoformat(), "end": e.end.isoformat()} for e in sorted(events, key=lambda x: (x.start, x.title))]
     (output_dir / "events.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "status.json").write_text(json.dumps([asdict(s) for s in statuses], ensure_ascii=False, indent=2), encoding="utf-8")
-    mh_events = previous_for_source(events, "Musikens Hus & Hängmattan")
+    mh_events = mh_group_events(events)
     if mh_events:
         cache_dir = output_dir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1599,28 +1653,76 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
         logging.info("Läste %d evenemang från föregående publicering som reservdata.", len(previous))
     if mh_source_cache:
         logging.info("Läste %d Musikens Hus/Hängmattan-poster från separat källcache.", len(mh_source_cache))
+
+    # Musikens Hus och Hängmattan delar webbkalender och hämtas därför en gång,
+    # men eventen behåller två separata arrangörskategorier.
     scrapers = [
         ("Fasching", scrape_fasching), ("Nefertiti", scrape_nefertiti), ("Playhouse", scrape_playhouse),
         ("Skeppet GBG", scrape_skeppet), ("Unity Jazz", scrape_unity),
-        ("Musikens Hus & Hängmattan", scrape_musikens_hus), ("Utopia Jazz", scrape_utopia),
+        ("Musikens Hus-kalender", scrape_musikens_hus), ("Utopia Jazz", scrape_utopia),
         ("Katalin", scrape_katalin), ("Jazz & Blues i Kungsbacka", scrape_jazzoblues_kungsbacka),
         ("Pustervik", scrape_pustervik),
     ]
     all_events: list[Event] = []
     statuses: list[SourceStatus] = []
+
+    def append_mh_status_rows(events: list[Event], ok: bool, using_fallback: bool, reason: str = "") -> None:
+        normalized = normalize_mh_sources(events)
+        for source_name in ("Musikens Hus", "Hängmattan"):
+            subset = [e for e in normalized if e.source == source_name]
+            latest = max((e.start.date() for e in subset), default=None)
+            if using_fallback:
+                if subset:
+                    message = f"Direkthämtningen från Musikens Hus webbkalender svarade inte. Visar {len(subset)} sparade poster."
+                else:
+                    message = "Direkthämtningen från Musikens Hus webbkalender svarade inte. Inga sparade poster för denna scen."
+            elif reason:
+                message = reason
+            else:
+                message = ""
+            statuses.append(SourceStatus(
+                source_name, ok, len(subset), latest.isoformat() if latest else "", message, using_fallback
+            ))
+
     for name, scraper in scrapers:
+        if name == "Musikens Hus-kalender":
+            prior = filter_window(mh_source_cache if mh_source_cache else mh_group_events(previous), today)
+            try:
+                events = normalize_mh_sources(filter_window(scraper(session, today), today))
+                if events:
+                    all_events.extend(events)
+                    append_mh_status_rows(events, True, False)
+                    logging.info(
+                        "Musikens Hus/Hängmattan: %d evenemang (%d Musikens Hus, %d Hängmattan)",
+                        len(events),
+                        sum(e.source == "Musikens Hus" for e in events),
+                        sum(e.source == "Hängmattan" for e in events),
+                    )
+                elif prior:
+                    all_events.extend(prior)
+                    append_mh_status_rows(prior, False, True)
+                    logging.warning("Musikens Hus/Hängmattan: använder reservdata (%d evenemang)", len(prior))
+                else:
+                    append_mh_status_rows([], False, False, "Inga framtida evenemang hittades. Kontrollera källan.")
+            except Exception as exc:
+                if prior:
+                    all_events.extend(prior)
+                    append_mh_status_rows(prior, False, True)
+                    # Det fullständiga teknikfelet sparas i Actions-loggen men visas inte på webbsidan.
+                    logging.warning("Musikens Hus/Hängmattan misslyckades, använder reservdata: %s", exc)
+                else:
+                    short = "Direkthämtningen från Musikens Hus webbkalender svarade inte och ingen reservdata finns ännu."
+                    append_mh_status_rows([], False, False, short)
+                    logging.warning("Musikens Hus/Hängmattan misslyckades utan reservdata: %s", exc)
+            continue
+
         prior = filter_window(previous_for_source(previous, name), today)
-        if name == "Musikens Hus & Hängmattan" and mh_source_cache:
-            # Den separata cachen är avsiktligt starkare än den allmänna events.json-cachen.
-            # Därmed kan en tidigare misslyckad publicering inte radera källans reservdata.
-            prior = filter_window(mh_source_cache, today)
         try:
             events = filter_window(scraper(session, today), today)
             if events:
                 all_events.extend(events)
                 latest = max(e.start.date() for e in events)
-                status_message = ""
-                statuses.append(SourceStatus(name, True, len(events), latest.isoformat(), status_message, False))
+                statuses.append(SourceStatus(name, True, len(events), latest.isoformat(), "", False))
                 logging.info("%s: %d evenemang, senaste %s", name, len(events), latest)
             elif prior:
                 all_events.extend(prior)
@@ -1634,18 +1736,21 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
             if prior:
                 all_events.extend(prior)
                 latest = max(e.start.date() for e in prior)
-                msg = f"Källan svarade inte: {exc}. Visar {len(prior)} senast kända poster från föregående publicering."
+                msg = f"Källan svarade inte. Visar {len(prior)} senast kända poster från föregående publicering."
                 statuses.append(SourceStatus(name, False, len(prior), latest.isoformat(), msg, True))
                 logging.warning("%s misslyckades, använder reservdata: %s", name, exc)
             else:
-                statuses.append(SourceStatus(name, False, 0, "", str(exc), False))
+                statuses.append(SourceStatus(name, False, 0, "", "Källan svarade inte. Ingen reservdata finns ännu.", False))
                 logging.warning("%s misslyckades: %s", name, exc)
-    all_events = deduplicate(filter_window(all_events, today))
+
+    # Deduplicering kan slå ihop källnamn med ' + '. Normalisera därför MH/Hängmattan
+    # en sista gång så att arrangörsfiltret alltid har exakt två val.
+    all_events = normalize_mh_sources(deduplicate(filter_window(all_events, today)))
     write_outputs(all_events, statuses, output_dir)
     return all_events, statuses
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Samlar nio eventkalendrar till prenumererbara ICS-filer.")
+    ap = argparse.ArgumentParser(description="Samlar eventkalendrar till prenumererbara ICS-filer.")
     ap.add_argument("--output-dir", default="public", help="Katalog för genererade filer")
     ap.add_argument("--date", help="Överstyr dagens datum, YYYY-MM-DD, praktiskt för test")
     ap.add_argument("--verbose", action="store_true")
