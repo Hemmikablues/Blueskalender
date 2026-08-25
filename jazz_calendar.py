@@ -25,7 +25,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TZID = "Europe/Stockholm"
-CALENDAR_VERSION = "2026-08-23-web-v9.1-katalin-kungsbacka-mh-local-cache"
+CALENDAR_VERSION = "2026-08-25-web-v9.2-pustervik-mh-local-cache"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36 "
@@ -42,6 +42,7 @@ SOURCES = {
     "Utopia Jazz": "https://billetto.se/users/utopia-jazz",
     "Katalin": "https://www.katalin.com/events/",
     "Jazz & Blues i Kungsbacka": "https://www.jazzoblues.se/",
+    "Pustervik": "https://pustervik.nu/kalender",
 }
 
 MONTHS = {
@@ -991,6 +992,116 @@ def scrape_utopia(session: requests.Session, today: date) -> list[Event]:
 
 
 
+
+def parse_pustervik_page(html: str, url: str, today: date | None = None) -> Event | None:
+    """Parse one Pustervik event page.
+
+    Pustervik exposes the authoritative stage time in the visible "Pa scen" field.
+    The listing page usually shows admission time instead, so detail pages are used
+    deliberately here. This parser is isolated from all Musikens Hus/Hangmattan code.
+    """
+    today = today or date.today()
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup_text(soup)
+    title = title_from_soup(soup)
+
+    # Do not publish cancelled events.
+    if re.search(r"\binst[aä]lld\b", title, re.I):
+        return None
+
+    d = parse_swedish_date(text, today)
+    stage_m = re.search(r"P[aå]\s+scen\s*:?[\s\u00a0]*([0-2]?\d[:.]\d{2})", text, re.I)
+    if not d or not stage_m:
+        return None
+    stage_t = parse_hhmm(stage_m.group(1))
+    if not stage_t:
+        return None
+
+    start = local_dt(d, stage_t)
+    end_m = re.search(r"Sluttid\s*:?[\s\u00a0]*([0-2]?\d[:.]\d{2})", text, re.I)
+    end_t = parse_hhmm(end_m.group(1)) if end_m else None
+    end = sensible_end(start, end_t)
+
+    venue_m = re.search(
+        r"Plats\s*:?[\s\u00a0]*(.+?)(?=\s+(?:Alder|Ålder|Biljetter|Arrang[oö]r|Datum|Insl[aä]pp|P[aå]\s+scen|Sluttid)\b|$)",
+        text,
+        re.I,
+    )
+    venue = clean_text(venue_m.group(1)) if venue_m else "Pustervik"
+
+    doors_m = re.search(r"Insl[aä]pp\s*:?[\s\u00a0]*([0-2]?\d[:.]\d{2})", text, re.I)
+    organizer_m = re.search(
+        r"Arrang[oö]r\s*:?[\s\u00a0]*(.+?)(?=\s+(?:Datum|Insl[aä]pp|P[aå]\s+scen|Sluttid|Plats|Alder|Ålder|Biljetter)\b|$)",
+        text,
+        re.I,
+    )
+    notes: list[str] = []
+    if doors_m:
+        notes.append(f"Insläpp {doors_m.group(1).replace('.', ':')}.")
+    if organizer_m:
+        notes.append(f"Arrangör: {clean_text(organizer_m.group(1))}.")
+
+    # The first short label immediately before the h1 is normally the genre.
+    category = ""
+    h1 = soup.find("h1")
+    if h1:
+        prev = h1.find_previous(string=True)
+        if prev:
+            candidate = clean_text(str(prev))
+            if candidate and len(candidate) <= 50 and candidate.lower() not in {"laddar evenemang", "med stöd från"}:
+                category = candidate
+
+    return Event(
+        title=title,
+        start=start,
+        end=end,
+        venue=venue,
+        address="Järntorgsgatan 12-14, Göteborg",
+        city="Göteborg",
+        source="Pustervik",
+        url=url,
+        description=" ".join(notes),
+        category=category,
+    )
+
+
+def scrape_pustervik(session: requests.Session, today: date) -> list[Event]:
+    """Read Pustervik's calendar and parse each future event detail page."""
+    base = SOURCES["Pustervik"]
+    soup = BeautifulSoup(fetch(session, base, timeout=20).text, "html.parser")
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = urljoin(base, a["href"]).split("#", 1)[0]
+        p = urlparse(href)
+        if p.netloc not in ("pustervik.nu", "www.pustervik.nu"):
+            continue
+        path = p.path.rstrip("/")
+        if not path.startswith("/evenemang/") or path == "/evenemang":
+            continue
+        if href not in seen:
+            seen.add(href)
+            links.append(href)
+
+    if not links:
+        raise SourceError("Pusterviks kalender gav inga evenemangslänkar.")
+
+    events: list[Event] = []
+    for link in links[:220]:
+        try:
+            r = session.get(link, timeout=18)
+            r.raise_for_status()
+            ev = parse_pustervik_page(r.text, link, today)
+            if ev:
+                events.append(ev)
+        except Exception as exc:
+            logging.debug("Pustervik event failed %s: %s", link, exc)
+
+    if not events:
+        raise SourceError("Pusterviks evenemangssidor kunde inte tolkas.")
+    return deduplicate(events)
+
 def parse_katalin_page(html: str, url: str, today: date | None = None) -> Event | None:
     """Parse one Katalin event page.
 
@@ -1353,6 +1464,7 @@ SOURCE_ALIASES = {
     "Utopia Jazz": {"Utopia Jazz"},
     "Katalin": {"Katalin"},
     "Jazz & Blues i Kungsbacka": {"Jazz & Blues i Kungsbacka"},
+    "Pustervik": {"Pustervik"},
 }
 
 
@@ -1492,6 +1604,7 @@ def run(today: date, output_dir: Path) -> tuple[list[Event], list[SourceStatus]]
         ("Skeppet GBG", scrape_skeppet), ("Unity Jazz", scrape_unity),
         ("Musikens Hus & Hängmattan", scrape_musikens_hus), ("Utopia Jazz", scrape_utopia),
         ("Katalin", scrape_katalin), ("Jazz & Blues i Kungsbacka", scrape_jazzoblues_kungsbacka),
+        ("Pustervik", scrape_pustervik),
     ]
     all_events: list[Event] = []
     statuses: list[SourceStatus] = []
